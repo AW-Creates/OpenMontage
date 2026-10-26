@@ -248,6 +248,7 @@ class HyperFramesCompose(BaseTool):
     # (get_info spam from the registry) are free.
     _npm_resolve_cache: Optional[dict[str, str]] = None
     _cli_probe_cache: Optional[dict[str, str]] = None
+    _verified_local_command: Optional[list[str]] = None
 
     @classmethod
     def _node_major_version(cls) -> Optional[int]:
@@ -284,6 +285,32 @@ class HyperFramesCompose(BaseTool):
         """
         if cls._npm_resolve_cache is not None:
             return cls._npm_resolve_cache
+
+        # A verified local executable must not depend on npm registry latency.
+        # This is a real doctor probe, not a Node/FFmpeg-only availability guess.
+        commands: list[list[str]] = []
+        installed = shutil.which(cls._NPM_PACKAGE)
+        if installed:
+            commands.append([installed])
+        npx = shutil.which("npx")
+        if npx:
+            # Strictly offline: never download a package during this fallback.
+            commands.append([npx, "--offline", "--no-install", cls._NPM_PACKAGE])
+        for command in commands:
+            try:
+                local_probe = subprocess.run(
+                    [*command, "doctor", "--json"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if local_probe.returncode == 0:
+                cls._verified_local_command = command
+                cls._cli_probe_cache = {"status": "ok"}
+                cls._npm_resolve_cache = {"version": "verified-local-cli"}
+                return cls._npm_resolve_cache
 
         npm = shutil.which("npm")
         if not npm:
@@ -1360,7 +1387,8 @@ class HyperFramesCompose(BaseTool):
         want to raise CalledProcessError on non-zero exits — the caller
         parses lint/validate/render exit codes itself.
         """
-        cmd = ["npx", "--yes", "hyperframes", *args]
+        local = type(self)._verified_local_command
+        cmd = [*local, *args] if local else ["npx", "--yes", "hyperframes", *args]
         # On Windows, resolve the .cmd wrapper so subprocess can find it
         # without shell=True.
         if os.name == "nt":
